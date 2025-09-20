@@ -1,0 +1,242 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+\titleformat{\section}[block]{\normalfont\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}[block]{\normalfont\large\bfseries}{\thesubsection}{1em}{}
+\title{AI-Powered Excel Mock Interviewer\\Implementation Manual}
+\author{Enterprise AI Solutions}
+\date{\today}
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose of This Document}
+This manual is a comprehensive reference for engineering, product, and operations teams deploying the AI-Powered Excel Mock Interviewer platform. It consolidates architectural rationale, configuration steps, operational procedures, and functional walkthroughs for both the FastAPI backend and the React front end. The document is written for practitioners who need to integrate the service into an enterprise environment, extend the feature set, or support live interview operations.
+
+\section{Solution Overview}
+The application delivers a structured mock interview environment that evaluates a candidate's Microsoft Excel proficiency with support from Azure OpenAI. It combines:
+\begin{itemize}[leftmargin=*]
+  \item A FastAPI service that orchestrates interview sessions, enforces deterministic prompt templates, and aggregates rubric-aligned scoring.
+  \item A React (Vite + Tailwind) front end that exposes interviewer controls, transcript visualization, real-time performance dashboards, and wrap-up report generation.
+  \item Azure OpenAI GPT deployments that generate interviewer dialogue, conduct turn-by-turn evaluations, and synthesize final summaries.
+\end{itemize}
+The backend maintains in-memory interview sessions for simplicity. For production, you can attach a persistent data store or cache to retain transcripts across processes and replicas.
+
+\section{Architecture}
+\subsection{Component Diagram}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Frontend}: React single-page application served by Vite. Communicates with the backend over HTTPS REST endpoints. Maintains client-side state for the active session, transcript, and real-time scores.
+  \item \textbf{Backend}: FastAPI application exposing `/api` routes. Manages session state, templated prompts, and scoring logic. Uses dependency injection to manage configuration and LLM clients.
+  \item \textbf{LLM Provider}: Azure OpenAI Chat Completions API. Invoked by the backend through the `AzureOpenAILLM` wrapper to enforce JSON response formats and deterministic behavior.
+  \item \textbf{Logging Layer}: Rotating file logger configured on startup to capture operational telemetry in `backend/logs/chatbot.log` alongside console output.
+\end{itemize}
+
+\subsection{Runtime Flow}
+\begin{enumerate}[leftmargin=*]
+  \item An interviewer configures a candidate persona in the front end and launches a session.
+  \item The front end POSTs to `/api/session`, which seeds an `InterviewSession` with system and bootstrap prompts, requests the first AI turn, and returns the initial interviewer message and evaluation metadata.
+  \item Subsequent candidate replies are sent to `/api/session/{id}/chat`. The backend appends the message to the conversation history, requests another completion from Azure OpenAI, and updates running rubric scores.
+  \item When an interviewer requests a summary, the front end calls `/api/session/{id}/summary`. The backend compiles the transcript, prompts the LLM for a final scorecard, and responds with the wrap-up payload.
+\end{enumerate}
+
+\section{Backend Deep Dive}
+\subsection{Configuration (`backend/app/config.py`)}
+Settings are hydrated from environment variables with optional `.env` support. The `Settings` class enforces presence of `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `AZURE_OPENAI_DEPLOYMENT` via the `require_azure_config` guard. CORS origins default to `*` but can be restricted via `CORS_ALLOW_ORIGINS`.
+
+\subsection{Application Entrypoint (`backend/app/main.py`)}
+The FastAPI application configures rotating file logging on startup, applies CORS middleware, and wires dependency-injected routes. `get_service` resolves configuration, memoizes the `InterviewService`, and guarantees Azure credentials are present before processing any request. Core endpoints include:
+\begin{itemize}[leftmargin=*]
+  \item `GET /api/health` --- Liveness probe returning `{status: "ok"}`.
+  \item `GET /api/rubric` --- Exposes the skill rubric used for scoring, allowing the front end to present rubric definitions.
+  \item `POST /api/session` --- Creates a new session and returns a first interviewer turn with evaluation stub data.
+  \item `POST /api/session/{session\_id}/chat` --- Processes candidate replies and returns updated transcript information plus running score averages.
+  \item `GET /api/session/{session\_id}/summary` --- Generates a final session summary containing the full transcript, aggregated scorecard, and recommended next steps.
+\end{itemize}
+Each route handles not-found errors and unexpected failures, re-raising them as FastAPI `HTTPException` instances with appropriate status codes.
+
+\subsection{Schema Contracts (`backend/app/schemas.py`)}
+Pydantic models define the canonical payloads exchanged between client and server as well as the internal data structures used to track interview progress. Key models include:
+\begin{itemize}[leftmargin=*]
+  \item `SessionCreateRequest` and `CandidateProfile` describing the interview context.
+  \item `ChatTurn`, `ChatMessage`, and `EvaluationSnapshot` encapsulating each conversational exchange and evaluation metadata provided by the LLM.
+  \item `ChatResponse` returning a single AI turn alongside running rubric scores.
+  \item `SummaryResponse` packaging the complete transcript, final summary text, recommended next steps, and overall skill scores.
+\end{itemize}
+These contracts align with the front-end TypeScript interfaces in `frontend/src/types.ts`, enabling strict type safety across the stack.
+
+\subsection{Interview Orchestration (`backend/app/services/interview_service.py`)}
+`InterviewService` coordinates LLM interactions and maintains `InterviewSession` state. Major responsibilities:
+\begin{description}[style=nextline]
+  \item[Session Lifecycle] The `create_session` method instantiates a unique session identifier, stores candidate metadata, and seeds the conversation with system and bootstrap prompts. It immediately calls the LLM to obtain the first interviewer question and evaluation stub so the UI can start the conversation.
+  \item[Turn Processing] The `chat` method records candidate messages, sends the entire message history to Azure OpenAI, and appends the assistant's JSON response to the transcript. Each LLM response must contain an interviewer message, evaluation object, and next-best action suggestion; these are converted into strongly typed Pydantic objects.
+  \item[Scoring Engine] The `InterviewSession.record_scores` helper updates running averages per rubric skill. Scores are averaged over the number of turns containing evaluations, ensuring smooth progression even when some turns omit scoring data.
+  \item[Summarization] The `summarize` method serializes the transcript, injects it into a summary prompt, and retrieves a final evaluation from the LLM. The result is normalized into a `SummaryResponse` consumable by the front end.
+  \item[Resilience] Defensive checks surface attempts to access unknown sessions and normalize missing evaluation blocks, preventing malformed responses from crashing the service.
+\end{description}
+
+\subsection{Prompt Engineering (`backend/app/utils/prompt_templates.py`)}
+Prompt helpers centralize the domain-specific instructions shared with the LLM:
+\begin{itemize}[leftmargin=*]
+  \item `SKILL_RUBRIC` describes the five core competencies measured during interviews.
+  \item `build_interview_system_prompt` constructs the system message that enforces JSON output structure, scoring behavior, and tone.
+  \item `build_session_bootstrap_prompt` personalizes the first interviewer turn using candidate persona details, focus areas, and scenario selection.
+  \item `build_summary_prompt` requests a wrap-up analysis with explicit JSON keys for the final summary, scorecard, and improvement recommendations.
+\end{itemize}
+Unit tests in `backend/tests/test_prompt_templates.py` guarantee that prompts reference rubric skills and instruct the model to respond with valid JSON.
+
+\subsection{Azure OpenAI Integration (`backend/app/services/llm_client.py`)}
+The `AzureOpenAILLM` wrapper encapsulates API interactions. It accepts configuration for deployment name, temperature, and token limits. Responses are requested using `response_format={"type": "json_object"}` to enforce structured outputs. The `extract_content` static method parses the first choice in the response payload and converts the JSON content into a Python dictionary. Errors in parsing raise a descriptive `ValueError`, helping operators detect prompt regressions early.
+
+\section{Frontend Deep Dive}
+\subsection{State Management (`frontend/src/App.tsx`)}
+The root component manages interview session state and orchestrates API calls through Axios. Important state variables:
+\begin{itemize}[leftmargin=*]
+  \item `sessionId` tracks the active backend session.
+  \item `turns` stores the transcript as an array of `ChatTurn` objects.
+  \item `runningScores` maintains the averaged rubric scores received from the backend.
+  \item `candidateInput`, `loading`, and `creating` control form interactions and button availability.
+  \item `summary` caches the final summary response when generated.
+  \item `error` surfaces operational issues to the user.
+\end{itemize}
+Memoized helpers prevent message submission while a request is in-flight or before a session has been created. API calls follow a consistent pattern: optimistic UI state updates, error handling with user-friendly messages, and teardown of loading indicators in `finally` blocks.
+
+\subsection{Candidate Configuration (`frontend/src/components/CandidateForm.tsx`)}
+The candidate form allows interviewers to craft personas, select focus areas, and choose from predefined business scenarios. `FocusArea` buttons toggle inclusion in the payload, providing immediate visual feedback using Tailwind utility classes. Form submission constructs a payload that mirrors the backend's `SessionCreateRequest` schema.
+
+\subsection{Transcript Experience (`frontend/src/components/ChatTranscript.tsx`)}
+Displays the conversation chronologically with separate panels for candidate and interviewer messages. Evaluations are shown in highlighted cards listing strengths, gaps, and the LLM's recommendation. When no transcript exists, an empty state encourages the interviewer to launch a session.
+
+\subsection{Performance Dashboard (`frontend/src/components/EvaluationPanel.tsx`)}
+Summarizes current rubric scores using progress bars and highlights the latest evaluation summary. Scores are derived from the backend's running averages, ensuring the dashboard aligns with the official scoring rubric.
+
+\subsection{Summary Delivery (`frontend/src/components/SummaryCard.tsx`)}
+When a wrap-up report is generated, this component presents the final summary, normalized scorecard, and next-step recommendations. Formatting favors readability for business stakeholders, making it suitable for sharing with hiring managers.
+
+\section{Functional Walkthrough}
+\subsection{Starting an Interview}
+\begin{enumerate}[leftmargin=*]
+  \item Populate the candidate form with persona details, experience, focus areas, and scenario.
+  \item Submit the form to create a session. The UI immediately shows the first interviewer question and evaluation stub.
+  \item Provide instructions to the candidate (real or simulated) to respond within the textarea.
+\end{enumerate}
+
+\subsection{Conducting the Conversation}
+\begin{enumerate}[leftmargin=*]
+  \item After each candidate reply, the backend prompts the LLM to generate the next interviewer turn.
+  \item The transcript panel updates with candidate and interviewer exchanges.
+  \item The evaluation panel refreshes running scores and displays the newest assessment summary.
+  \item The "Generate wrap-up report" button remains available throughout the session, allowing the interviewer to obtain interim summaries as needed.
+\end{enumerate}
+
+\subsection{Ending the Session}
+\begin{enumerate}[leftmargin=*]
+  \item Click \texttt{Generate wrap-up report}. The backend aggregates the transcript and requests a final summary from the LLM.
+  \item Once returned, the summary card presents share-ready insights and recommended next steps.
+  \item Download or copy the summary for documentation purposes. (Integrations for exporting to PDF or ATS systems can be layered on in future releases.)
+\end{enumerate}
+
+\section{Deployment and Operations}
+\subsection{Prerequisites}
+\begin{itemize}[leftmargin=*]
+  \item Python 3.11 or higher.
+  \item Node.js 18 or higher for building the front end.
+  \item Azure OpenAI resource with a deployed GPT model (e.g., `gpt-4o-mini`).
+\end{itemize}
+
+\subsection{Backend Setup}
+\begin{enumerate}[leftmargin=*]
+  \item Create a virtual environment, install dependencies from `requirements.txt`, and copy `.env.example` to `.env`.
+  \item Populate Azure credentials and optional CORS configuration.
+  \item Launch the API with `uvicorn app.main:app --reload` for development or a production-grade ASGI server for live deployments.
+  \item Verify health via `GET /api/health` and inspect `backend/logs/chatbot.log` for operational telemetry.
+\end{enumerate}
+
+\subsection{Frontend Setup}
+\begin{enumerate}[leftmargin=*]
+  \item Install dependencies with `npm install`.
+  \item Configure `VITE_API_BASE_URL` in `.env` to point at the backend host.
+  \item Run `npm run dev` for local development or `npm run build` to produce a production bundle.
+\end{enumerate}
+
+\subsection{Testing}
+\begin{itemize}[leftmargin=*]
+  \item Execute backend unit tests via `pytest` to validate prompt templates.
+  \item Run `npm run build` or `npm run test` (if configured) to ensure the front end compiles with TypeScript type safety.
+\end{itemize}
+
+\section{Security and Compliance Considerations}
+\begin{itemize}[leftmargin=*]
+  \item Store Azure OpenAI credentials in an enterprise secrets manager (Azure Key Vault, AWS Secrets Manager, etc.) and avoid committing secrets to source control.
+  \item Restrict CORS origins to trusted domains in production.
+  \item Enable private networking between the backend and Azure OpenAI endpoints when available to minimize exposure.
+  \item Implement audit logging for transcripts before launching in regulated environments.
+  \item Consider integrating enterprise identity providers (Azure AD, Okta) to authenticate interviewer access and sign API requests using JWTs.
+\end{itemize}
+
+\section{Extensibility Guidance}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Persistence}: Replace the in-memory session dictionary with a durable store (Redis, PostgreSQL) to support multiple application replicas.
+  \item \textbf{Question Bank Hybridization}: Augment prompts with curated questions for deterministic coverage of specific skills.
+  \item \textbf{Analytics}: Stream transcript events to a data warehouse for longitudinal performance insights and fairness auditing.
+  \item \textbf{Multi-Modal Inputs}: Incorporate file uploads (Excel workbooks) and extend prompts to evaluate formula outputs or pivot table configurations.
+  \item \textbf{Localization}: Externalize prompt copy and UI text to support additional languages and regional hiring practices.
+\end{itemize}
+
+\section{Troubleshooting}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{LLM Parsing Errors}: Check Azure OpenAI responses in logs. Ensure prompts still enforce JSON-only responses and update parsing logic if Azure modifies payload structure.
+  \item \textbf{Session Not Found}: Verify that the front end caches the `session_id` and that the backend process did not restart (sessions are currently in-memory).
+  \item \textbf{CORS Failures}: Inspect the `Access-Control-Allow-Origin` headers and adjust `CORS_ALLOW_ORIGINS` to include the front-end domain.
+  \item \textbf{Slow Responses}: Reduce prompt verbosity, adjust `max_tokens`, or scale Azure deployment capacity. Consider enabling streaming responses for the candidate UI.
+\end{itemize}
+
+\section{Appendix}
+\subsection{API Reference}
+\begin{longtable}{>{\raggedright\arraybackslash}p{3cm} >{\raggedright\arraybackslash}p{3.5cm} >{\raggedright\arraybackslash}p{7cm}}
+\toprule
+\textbf{Method} & \textbf{Endpoint} & \textbf{Description} \\ \midrule
+GET & `/api/health` & Service liveness probe. Returns `{ "status": "ok" }`. \\
+GET & `/api/rubric` & Returns the interview skill rubric for UI display. \\
+POST & `/api/session` & Creates a session. Body: `SessionCreateRequest`. Returns `SessionCreateResponse` with the first `ChatTurn`. \\
+POST & `/api/session/{id}/chat` & Submits a candidate message. Body: `{ "message": string }`. Returns `ChatResponse` including running rubric averages. \\
+GET & `/api/session/{id}/summary` & Generates a session wrap-up. Returns `SummaryResponse` with transcript and recommendations. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Skill Rubric}
+\begin{longtable}{>{\raggedright\arraybackslash}p{4cm} >{\raggedright\arraybackslash}p{9cm}}
+\toprule
+\textbf{Skill} & \textbf{Description} \\ \midrule
+Excel Functions & Ability to apply advanced formulas such as INDEX/MATCH, XLOOKUP, and array formulas. \\
+Data Analysis & Competence in manipulating, cleaning, and analyzing datasets using tables, pivot tables, and Power Query. \\
+Automation & Proficiency with macros, VBA, Office Scripts, and process automation. \\
+Business Acumen & Skill in translating business problems into analytical solutions and communicating insights. \\
+Storytelling & Clarity and structure when presenting findings, including dashboards and executive-ready narratives. \\
+\bottomrule
+\end{longtable}
+
+\section*{Revision History}
+\begin{tabular}{@{}p{3cm}p{3cm}p{7cm}@{}}
+\toprule
+\textbf{Date} & \textbf{Version} & \textbf{Notes} \\ \midrule
+\today & 0.1 & Initial comprehensive manual covering architecture, usage, and extensibility. \\
+\bottomrule
+\end{tabular}
+
+\end{document}
